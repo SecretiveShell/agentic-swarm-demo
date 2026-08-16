@@ -39,12 +39,10 @@ uv run agentic-swarm-demo \
 ## Run a 20-agent task pool
 
 Set `--workers 20` as an upper bound. The launcher starts workers only while
-unchecked tasks exist, never exceeding twenty simultaneous containers. Each
-worker atomically claims one task from `todo.md`, removes it from the todo list,
-completes it, writes a report, appends a summary to `completed.md`, and retires.
-If a worker adds follow-up tasks, the launcher fills newly available capacity
-until the task board is empty. A lock-backed `task_board.py` helper mediates
-concurrent task claims and updates.
+ready task files exist, never exceeding twenty simultaneous containers. The
+orchestrator assigns each task before starting a container. Each worker writes a
+report and can propose up to two follow-up Markdown files; it never claims,
+renames, or completes tasks itself.
 
 ```bash
 uv run agentic-swarm-demo \
@@ -59,13 +57,45 @@ uv run agentic-swarm-demo \
   --task 'Inspect module B and document its public API.'
 ```
 
-To seed a longer Markdown list, use `--todo-file path/to/todo.md` instead of
-repeating `--task`. The shared directory is `/tmp/swarm-run/shared` and contains
-`todo.md`, `completed.md`, and `reports/`. Private workspaces are under
-`/tmp/swarm-run/workspaces`.
+Use `--task-dir path/to/tasks` to seed a run from Markdown files:
 
-`--objective` is written once to `shared/objective.md`. Every worker reads it
-before claiming a task and uses it to guide follow-ups and reports.
+```text
+tasks/
+  001-research.md
+  002-synthesis.md
+```
+
+The shared directory contains `tasks/ready`, `tasks/assigned`,
+`tasks/completed`, `tasks/blocked`, `proposals/`, and `reports/`. Private
+workspaces are under `/tmp/swarm-run/workspaces`.
+
+`--objective` is written to `shared/objective.md` and included in every
+worker's prompt.
+
+## Generate the initial queue from the objective
+
+Omit both `--task` and `--task-dir` to run one bootstrap planner before any
+workers start. It reads the objective, writes 3–12 bounded Markdown task files,
+and the orchestrator validates and moves them into `tasks/ready`. The planner is
+named `<agent-id>-planner`; it plans only and does not execute the tasks.
+
+```bash
+uv run agentic-swarm-demo \
+  --agent-id researcher \
+  --workers 6 \
+  --run-dir /tmp/swarm-run \
+  --objective 'Produce a source-backed comparison of local coding-agent orchestration patterns.' \
+  --model your-model \
+  --api-base http://host.docker.internal:8001/v1 \
+  --context-window 131072 \
+  --tui
+```
 
 Add `--tui` to display a live terminal dashboard with active workers, their
-claimed tasks, elapsed runtime, and retirement status.
+claimed tasks, elapsed runtime, retirement status, and a recent feed of Codex
+tool output from each container.
+
+After all ready work (including accepted follow-up tasks) has retired, a final
+`<agent-id>-summarizer` container reads the objective, worker reports, and task
+outcomes. It writes the user-facing result to `shared/final.md`; the launcher
+prints that path when the run succeeds.
