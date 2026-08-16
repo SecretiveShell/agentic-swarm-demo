@@ -1,0 +1,20 @@
+[project]
+name = "agentic-swarm-demo"
+version = "0.1.0"
+description = "Run a single Codex agent in an isolated Docker container"
+readme = "README.md"
+authors = [
+    { name = "TerminalMan", email = "84923604+SecretiveShell@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "anyio>=4.14.2",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+agentic-swarm-demo = "agentic_swarm_demo.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
