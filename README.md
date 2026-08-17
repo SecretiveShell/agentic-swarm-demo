@@ -1,3 +1,10 @@
+# Agentic Swarm Demo
+
+This is a quick-and-dirty experimental demo of swarm agents using the Codex CLI
+and Docker. It is intended for exploration, not production use: expect rough
+edges, validate the agents' output, and review the security model before using
+it with sensitive code or credentials.
+
 ## Run with one worker
 
 By default, the command permits one automatically removed Docker container at a
