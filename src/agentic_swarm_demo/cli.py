@@ -20,10 +20,16 @@ from rich.table import Table
 
 from .task_queue import (
     Assignment,
+    Proposal,
+    apply_evaluation,
     assign,
+    claim_proposal,
+    evaluation_decision,
+    evaluation_path,
     finalize,
     ingest_bootstrap_tasks,
     initialize,
+    proposal_counts,
     ready_count,
     task_counts,
 )
@@ -56,6 +62,7 @@ class AgentState:
 STATUS_STYLES = {
     "starting": "yellow",
     "working": "cyan",
+    "evaluating": "magenta",
     "completed": "green",
     "blocked": "red",
 }
@@ -117,10 +124,13 @@ Protocol:
 1. Make a useful bounded advance on this task only.
 2. Write /shared/reports/{agent_id}.md. Start it with exactly Status: completed
    or Status: blocked, then explain progress, sources or results, and blockers.
-3. You may propose at most two container-executable follow-up tasks by writing
-   Markdown files named /shared/proposals/{agent_id}-<slug>.md. Do not propose
-   work requiring host root, SSH credentials, Docker sockets, service changes,
-   or other unavailable authority; record those as blockers in your report.
+3. You may propose at most two follow-up tasks by writing Markdown files named
+   /shared/proposals/pending/{agent_id}-<slug>.md. Proposals are not work: an
+   independent evaluator can approve or reject them, and only the orchestrator
+   can create or schedule a task. Each proposal needs a # title, a bounded
+   deliverable, and clear acceptance criteria. Do not propose work requiring
+   host root, SSH credentials, Docker sockets, service changes, or unavailable
+   authority; record those as blockers in your report.
 4. Do not modify /shared/tasks/, another agent's report, or /shared/objective.md.
 5. Do not modify source files outside /workspace.
 
@@ -257,6 +267,55 @@ modify task files, reports, the objective, or anything outside /workspace and
     return result.exit_code
 
 
+async def evaluate_proposal(
+    *,
+    run_dir: Path,
+    image: str,
+    model: str,
+    api_base: str,
+    context_window: int,
+    proposal: Proposal,
+    show_output: bool,
+    on_output: Callable[[str], None] | None = None,
+) -> tuple[int, str]:
+    """Run a constrained evaluator; the orchestrator applies its decision."""
+    evaluator_id = f"evaluator-{proposal.proposal_id}"[:96]
+    decision_file = f"/shared/evaluations/{proposal.proposal_id}.md"
+    prompt = f"""You are proposal evaluator {evaluator_id}. Read /shared/objective.md.
+
+Evaluate this proposed follow-up, but do not perform the task itself:
+
+Parent task: {proposal.parent_task}
+Proposal:
+---
+{proposal.body}
+---
+
+Approve only if it is concrete, bounded, materially advances the objective,
+has a clear deliverable and acceptance criteria, is not a duplicate of the
+parent task, and needs no host root, SSH, Docker socket, service change, or
+other unavailable authority. Reject speculative research expansion, vague work,
+or work whose value does not justify delaying final synthesis.
+
+Write exactly one decision file at {decision_file}. Its first line must be
+exactly `Decision: approved` or `Decision: rejected`; follow with a concise
+reason. Do not modify /shared/tasks, /shared/proposals, reports, the objective,
+or any path outside /workspace and that decision file. The orchestrator alone
+will apply your decision. Retire after writing it."""
+    result = await run_agent(
+        agent_id=evaluator_id,
+        run_dir=run_dir,
+        image=image,
+        model=model,
+        api_base=api_base,
+        context_window=context_window,
+        prompt=prompt,
+        show_output=show_output,
+        on_output=on_output,
+    )
+    return result.exit_code, evaluator_id
+
+
 async def run_workers(
     *,
     agent_id: str,
@@ -276,6 +335,7 @@ async def run_workers(
     send, receive = anyio.create_memory_object_stream[tuple[int, int]](workers)
     states: dict[int, AgentState] = {}
     activity_feed: deque[tuple[str, str, str]] = deque(maxlen=80)
+    evaluation_lock = anyio.Lock()
 
     def add_event(agent: str, event: str, detail: str = "") -> None:
         activity_feed.append((agent, event, detail[:180]))
@@ -286,18 +346,27 @@ async def run_workers(
         completed = counts["completed"]
         blocked = counts["blocked"]
         assigned = counts["assigned"]
+        created = counts["created"]
+        proposals = proposal_counts(shared_dir)
         header = Text(justify="center")
         header.append("AGENT SWARM", style="bold cyan")
         header.append("  •  ")
         header.append(f"{active}/{workers} active", style="bold" if active else "dim")
         header.append("  •  ")
-        header.append(f"{counts['ready']} ready", style="yellow" if counts["ready"] else "dim")
+        header.append(f"{counts['scheduled']} scheduled", style="yellow" if counts["scheduled"] else "dim")
+        header.append("  •  ")
+        header.append(f"{created} created", style="dim")
         header.append("  •  ")
         header.append(f"{assigned} assigned", style="cyan" if assigned else "dim")
         header.append("  •  ")
         header.append(f"{completed} completed", style="green" if completed else "dim")
         header.append("  •  ")
         header.append(f"{blocked} blocked", style="red" if blocked else "dim")
+        header.append("  •  ")
+        header.append(
+            f"{proposals['pending']} proposals",
+            style="magenta" if proposals["pending"] else "dim",
+        )
 
         table = Table(expand=True, header_style="bold", pad_edge=True)
         table.add_column("Agent", style="bold", no_wrap=True, width=18)
@@ -321,7 +390,7 @@ async def run_workers(
                 state.activity,
             )
         if not states:
-            table.add_row("—", "idle", "—", "Waiting for a ready task", "")
+            table.add_row("—", "idle", "—", "Waiting for a scheduled task", "")
 
         feed = Table(expand=True, header_style="bold")
         feed.add_column("Agent", width=18, no_wrap=True)
@@ -374,6 +443,38 @@ async def run_workers(
                 states[slot].activity = message
                 add_event(slot_id, "output", message)
 
+        async def evaluate_followups() -> None:
+            """Serialize evaluator decisions so task creation stays auditable."""
+            async with evaluation_lock:
+                while True:
+                    proposal = claim_proposal(
+                        shared_dir,
+                        proposer=slot_id,
+                        parent_task=assignment.title,
+                    )
+                    if proposal is None:
+                        return
+                    states[slot].status = "evaluating"
+                    states[slot].activity = f"Evaluating proposal: {proposal.title}"
+                    add_event(slot_id, "evaluating", proposal.title)
+                    evaluator_exit, _evaluator_id = await evaluate_proposal(
+                        run_dir=run_dir,
+                        image=image,
+                        model=model,
+                        api_base=api_base,
+                        context_window=context_window,
+                        proposal=proposal,
+                        show_output=not show_tui,
+                        on_output=record_output,
+                    )
+                    decision, reason = evaluation_decision(evaluation_path(shared_dir, proposal))
+                    if evaluator_exit != 0:
+                        decision = "rejected"
+                        reason = f"Evaluator exited with code {evaluator_exit}."
+                    outcome = apply_evaluation(shared_dir, proposal, decision, reason)
+                    states[slot].activity = f"Proposal {outcome}: {proposal.title}"
+                    add_event(slot_id, outcome, proposal.title)
+
         try:
             result = await run_agent(
                 agent_id=slot_id,
@@ -388,9 +489,13 @@ async def run_workers(
             )
             exit_code = result.exit_code
             states[slot].exit_code = exit_code
-            states[slot].status = finalize(shared_dir, assignment, slot_id, exit_code)
+            final_state = finalize(shared_dir, assignment, slot_id, exit_code)
+            states[slot].status = final_state
+            if final_state == "completed":
+                await evaluate_followups()
+            states[slot].status = final_state
             states[slot].activity = "Task report validated; worker retired"
-            add_event(slot_id, "retired", states[slot].status)
+            add_event(slot_id, "retired", final_state)
             if not show_tui:
                 print(f"[{slot_id}] retired with exit code {exit_code}", file=sys.stderr)
         except Exception as exc:

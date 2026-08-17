@@ -39,10 +39,10 @@ uv run agentic-swarm-demo \
 ## Run a 20-agent task pool
 
 Set `--workers 20` as an upper bound. The launcher starts workers only while
-ready task files exist, never exceeding twenty simultaneous containers. The
+scheduled task files exist, never exceeding twenty simultaneous containers. The
 orchestrator assigns each task before starting a container. Each worker writes a
 report and can propose up to two follow-up Markdown files; it never claims,
-renames, or completes tasks itself.
+renames, completes, creates, or schedules tasks itself.
 
 ```bash
 uv run agentic-swarm-demo \
@@ -65,9 +65,26 @@ tasks/
   002-synthesis.md
 ```
 
-The shared directory contains `tasks/ready`, `tasks/assigned`,
-`tasks/completed`, `tasks/blocked`, `proposals/`, and `reports/`. Private
-workspaces are under `/tmp/swarm-run/workspaces`.
+## Task and proposal lifecycle
+
+Tasks and proposals have separate, orchestrator-owned state machines:
+
+```text
+proposal: pending → evaluating → approved | rejected
+task:     created → scheduled → assigned → completed | blocked | cancelled
+```
+
+A worker writes proposals only to `proposals/pending/`. After a completed task,
+a separate evaluator container reads each proposal and writes an `approved` or
+`rejected` decision under `evaluations/`. The orchestrator validates that
+decision: approved proposals become new task files, move through `created` and
+`scheduled`, and may then be assigned; rejected proposals are retained under
+`proposals/rejected/` for audit. Evaluators never modify task state themselves.
+
+The shared directory contains `tasks/{created,scheduled,assigned,completed,
+blocked,cancelled}`, `proposals/{pending,evaluating,approved,rejected}`,
+`evaluations/`, and `reports/`. Private workspaces are under
+`/tmp/swarm-run/workspaces`.
 
 `--objective` is written to `shared/objective.md` and included in every
 worker's prompt.
@@ -76,7 +93,7 @@ worker's prompt.
 
 Omit both `--task` and `--task-dir` to run one bootstrap planner before any
 workers start. It reads the objective, writes 3–12 bounded Markdown task files,
-and the orchestrator validates and moves them into `tasks/ready`. The planner is
+and the orchestrator validates, creates, and schedules them. The planner is
 named `<agent-id>-planner`; it plans only and does not execute the tasks.
 
 ```bash
